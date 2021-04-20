@@ -14,6 +14,9 @@
 typedef struct settings {
     int proxy_address;
     short proxy_port;
+    short use_auth = 0;
+    char proxy_username[255] = {0};
+    char proxy_password[255] = {0};
 } setting_t;
 
 static setting_t settings;
@@ -33,6 +36,18 @@ extern "C" {
     __declspec(dllexport) void set_proxy_port(void * args)
     {
         settings.proxy_port = *((short *)args);
+    }
+
+    __declspec(dllexport) void set_proxy_username(LPCSTR args)
+    {
+        settings.use_auth = 1;
+        strcpy(settings.proxy_username, args);
+    }
+
+    __declspec(dllexport) void set_proxy_password(LPCSTR args)
+    {
+        settings.use_auth = 1;
+        strcpy(settings.proxy_password, args);
     }
 
 #pragma endregion 
@@ -340,36 +355,158 @@ int WINAPI my_connect(SOCKET s, const struct sockaddr * name, int namelen)
     //
     // Prepare greeting payload
     // 
-    char greetProxy[3];
+
+
+    // SERVER AUTHENTICATION REQUEST
+    // The client connects to the server, and sends a version
+    // identifier/method selection message:
+    //
+    //      +----+----------+----------+
+    //      |VER | NMETHODS | METHODS  |
+    //      +----+----------+----------+
+    //      | 1  |    1     | 1 to 255 |
+    //      +----+----------+----------+
+    char greetProxy[4];
+
     greetProxy[0] = 0x05; // Version (always 0x05)
-    greetProxy[1] = 0x01; // Number of authentication methods
-    greetProxy[2] = 0x00; // NO AUTHENTICATION REQUIRED
+    greetProxy[1] = 0x02; // Number of authentication methods (2 methods: none - 0, username/password - 2)
+    greetProxy[2] = 0x00; // 0: NO AUTHENTICATION REQUIRED
+    greetProxy[3] = 0x02; // 2: AUTH WITH USERNAME/PASSWORD
 
-    spdlog::info("Sending greeting to proxy");
+    //  SERVER AUTHENTICATION RESPONSE
+    //  The server selects from one of the methods given in METHODS, and
+    //  sends a METHOD selection message:
+    //
+    //     +----+--------+
+    //     |VER | METHOD |
+    //     +----+--------+
+    //     | 1  |   1    |
+    //     +----+--------+
+    //
+    //  If the selected METHOD is X'FF', none of the methods listed by the
+    //  client are acceptable, and the client MUST close the connection.
+    //
+    //  The values currently defined for METHOD are:
+    //   * X'00' NO AUTHENTICATION REQUIRED
+    //   * X'01' GSSAPI
+    //   * X'02' USERNAME/PASSWORD
+    //   * X'03' to X'7F' IANA ASSIGNED
+    //   * X'80' to X'FE' RESERVED FOR PRIVATE METHODS
+    //   * X'FF' NO ACCEPTABLE METHODS
 
-    if (WSASendSync(s, greetProxy, sizeof(greetProxy)))
-    {
-        char response[2] = { 0 };
+    char greetResponse[2] = { 0 };
 
-        if (WSARecvSync(s, response, sizeof(response))
-            && response[0] == 0x05 /* expected version */
-            && response[1] == 0x00 /* success value */)
-        {
-            spdlog::info("Proxy accepted greeting without authentication");
-        }
-        else
-        {
-            spdlog::error("Proxy greeting failed");
-            LogWSAError();
-            return SOCKET_ERROR;
-        }
-    }
-    else
+    if (!WSASendSync(s, greetProxy, sizeof(greetProxy)))
     {
         spdlog::error("Failed to greet SOCKS proxy server");
         LogWSAError();
         return SOCKET_ERROR;
+    }       
+
+    if (!WSARecvSync(s, greetResponse, sizeof(greetResponse)))
+    {
+        spdlog::error("Proxy greeting failed on get response");
+        LogWSAError();
+        return SOCKET_ERROR;
+    }    
+
+    if(greetResponse[0] != 0x05)
+    {
+        spdlog::error("Proxy greeting failed: invalid version {}", greetResponse[0]);
+        LogWSAError();
+        return SOCKET_ERROR;
     }
+
+    if(greetResponse[1] == 0xff)
+    {
+        spdlog::error("Proxy greeting failed: no auth method available");
+        LogWSAError();
+        return SOCKET_ERROR;
+    }    
+
+    if(greetResponse[1] == 0x02 && settings.use_auth == 0)
+    {
+        spdlog::error("Proxy greeting failed: requires username/password", greetResponse);
+        LogWSAError();
+        return SOCKET_ERROR;
+    }
+
+    spdlog::info("Proxy accepted greeting. Using username/password authentication: {}", (greetResponse[1] == 0x02 ? "Yes":"No")); 
+
+    if(greetResponse[1] == 0x02 && settings.use_auth == 1)
+    {
+        int username_length = strlen(settings.proxy_username);
+        int password_length = strlen(settings.proxy_password);
+
+        if(username_length == 0 || password_length == 0)
+        {
+            spdlog::error("Invalid username/password provided for proxy");
+            LogWSAError();
+            return SOCKET_ERROR;
+        }
+
+        // USERNAME / PASSWORD SERVER REQUEST
+        // Once the SOCKS V5 server has started, and the client has selected the
+        // Username/Password Authentication protocol, the Username/Password
+        // subnegotiation begins.  This begins with the client producing a
+        // Username/Password request:
+        //
+        //       +----+------+----------+------+----------+
+        //       |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+        //       +----+------+----------+------+----------+
+        //       | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+        //       +----+------+----------+------+----------+
+
+        char* proxyAuth = (char *)calloc(3 + username_length + password_length, sizeof(char));
+
+        // for SOCKS5 username/password authentication the VER field must be set to 0x01
+        //  http://en.wikipedia.org/wiki/SOCKS
+        //      field 1: version number, 1 byte (must be 0x01)"
+        proxyAuth[0] = 0x01;
+        proxyAuth[1] = username_length;
+        strncpy(proxyAuth + 2, settings.proxy_username, username_length);        
+        proxyAuth[username_length + 2] = password_length;
+        strncpy(proxyAuth + username_length + 3, settings.proxy_password, password_length);
+
+        spdlog::info("Sending username {} and password {} auth to proxy", settings.proxy_username, settings.proxy_password);
+
+        if (!WSASendSync(s, proxyAuth, 3 + username_length + password_length))
+        {
+            spdlog::error("Proxy auth failed on send username/password");
+            LogWSAError();
+            return SOCKET_ERROR;
+        }
+
+        // USERNAME / PASSWORD SERVER RESPONSE
+        // The server verifies the supplied UNAME and PASSWD, and sends the
+        // following response:
+        //
+        //   +----+--------+
+        //   |VER | STATUS |
+        //   +----+--------+
+        //   | 1  |   1    |
+        //   +----+--------+
+        //
+        // A STATUS field of X'00' indicates success. If the server returns a
+        // `failure' (STATUS value other than X'00') status, it MUST close the
+        // connection.
+
+        char authResponse[2] = { 0 };
+
+        if (!WSARecvSync(s, authResponse, sizeof(authResponse)))
+        {
+            spdlog::error("Proxy auth failed on get response");
+            LogWSAError();
+            return SOCKET_ERROR;
+        }
+
+        if(authResponse[1] != 0x00)
+        {
+            spdlog::error("Proxy auth failed. Invalid username or password: {0:x}", authResponse[1]);
+            LogWSAError();
+            return SOCKET_ERROR;
+        }
+    }   
 
     //
     // Prepare remote connect request
@@ -425,6 +562,7 @@ BOOL WINAPI DllMain(HINSTANCE dll_handle, DWORD reason, LPVOID reserved)
     case DLL_PROCESS_ATTACH:
         settings.proxy_address = 0x0100007F; // 127.0.0.1
         settings.proxy_port = 0x3804; // 1080
+        settings.use_auth = 0;
 
         {
             auto logger = spdlog::basic_logger_mt(
